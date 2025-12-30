@@ -8,7 +8,9 @@ from pymongo import MongoClient
 app = Flask(__name__)
 
 # ================== LOAD ML MODEL ==================
-MODEL_PATH = r'C:\Users\bhyri\Desktop\crop_recommendation_api\crop_model.pkl'
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, "crop_model.pkl")
+
 model = joblib.load(MODEL_PATH)
 
 # ================== MONGODB CONNECTION ==================
