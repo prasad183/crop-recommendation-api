@@ -1,133 +1,141 @@
 from flask import Flask, request, jsonify
-import joblib
 import numpy as np
-from fuzzywuzzy import process
+import joblib
 import os
 from pymongo import MongoClient
+from fuzzywuzzy import process
 
+# -------------------- APP INIT --------------------
 app = Flask(__name__)
 
-# ================== LOAD ML MODEL ==================
+# -------------------- LOAD MODEL --------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "crop_model.pkl")
 
 model = joblib.load(MODEL_PATH)
 
-# ================== MONGODB CONNECTION ==================
-MONGO_URI = os.getenv("MONGO_URI")
-
-if not MONGO_URI:
-    raise Exception("❌ MONGO_URI environment variable not set")
+# -------------------- MONGODB CONNECTION --------------------
+MONGO_URI = os.environ.get("MONGO_URI")
 
 client = MongoClient(
     MONGO_URI,
     serverSelectionTimeoutMS=5000
 )
 
-# ================== HELPER FUNCTIONS ==================
+db = client["cropdb"]
+mandi_collection = db["mandi_demand"]
 
-# Get best mandi name using fuzzy match from DB
-def get_best_mandi(city):
-    if not city:
-        return None
-
-    city_lower = city.lower().strip()
-
-    mandis = db.mandi_demand.distinct("mandi")
-    if not mandis:
-        return None
-
-    best_match, score = process.extractOne(city_lower, mandis)
-    return best_match if score > 75 else None
-
-
-# Fetch high-demand crops from MongoDB
-def get_high_demand_crops_from_db(mandi):
-    cursor = db.mandi_demand.find(
-        {"mandi": mandi},
-        {"_id": 0, "crop": 1, "arrivals_tonnes": 1}
-    ).sort("arrivals_tonnes", -1).limit(5)
-
-    return list(cursor)
-
-
-# ML prediction (UNCHANGED)
+# -------------------- UTILITY FUNCTIONS --------------------
 def predict_suitability(inputs):
-    input_array = np.array([inputs]).reshape(1, -1)
+    """
+    inputs = [N, P, K, temperature, humidity, ph, rainfall]
+    """
+    input_array = np.array(inputs).reshape(1, -1)
+
     probabilities = model.predict_proba(input_array)[0]
-    crop_classes = model.classes_
+    crops = model.classes_
 
     top_indices = np.argsort(probabilities)[::-1][:5]
-    results = []
 
+    results = []
     for i in top_indices:
-        crop = crop_classes[i]
-        score = round(probabilities[i], 2)
+        score = round(float(probabilities[i]), 2)
         results.append({
-            "crop": crop,
+            "crop": crops[i],
             "suitability_score": score,
             "expected_yield": "20-35 quintals/acre",
-            "risk_level": "Low" if score > 0.8 else "Medium" if score > 0.5 else "High"
+            "risk_level": "Low" if score > 0.75 else "Medium" if score > 0.4 else "High"
         })
 
     return results
 
 
-# ================== API ROUTES ==================
+def get_best_mandi(city):
+    if not city:
+        return None
+
+    city = city.lower().strip()
+
+    mandis = mandi_collection.distinct("area")
+    if not mandis:
+        return None
+
+    best_match, score = process.extractOne(city, mandis)
+    return best_match if score > 70 else None
+
+
+def get_high_demand_crops(mandi):
+    if not mandi:
+        return []
+
+    docs = mandi_collection.find(
+        {"area": mandi, "demand": "High"},
+        {"_id": 0, "crop": 1}
+    )
+
+    return [d["crop"] for d in docs]
+
+# -------------------- ROUTES --------------------
+@app.route("/", methods=["GET"])
+def home():
+    return "Crop Recommendation API is Running!"
+
 
 @app.route("/recommend", methods=["POST"])
 def recommend():
-    data = request.get_json()
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "Invalid JSON input"}), 400
 
-    city = data.get("city", "").strip()
-    N = float(data.get("N", 0))
-    P = float(data.get("P", 0))
-    K = float(data.get("K", 0))
-    temperature = float(data.get("temperature", 25))
-    humidity = float(data.get("humidity", 70))
-    ph = float(data.get("ph", 6.5))
-    rainfall = float(data.get("rainfall", 200))
+        city = data.get("city", "").strip()
 
-    inputs = [N, P, K, temperature, humidity, ph, rainfall]
-    recommended_crops = predict_suitability(inputs)
+        inputs = [
+            float(data.get("N", 0)),
+            float(data.get("P", 0)),
+            float(data.get("K", 0)),
+            float(data.get("temperature", 25)),
+            float(data.get("humidity", 70)),
+            float(data.get("ph", 6.5)),
+            float(data.get("rainfall", 200))
+        ]
 
-    # ---- MongoDB mandi demand ----
-    mandi = get_best_mandi(city)
-    high_demand_list = get_high_demand_crops_from_db(mandi) if mandi else []
-    high_demand_crop_names = [item["crop"] for item in high_demand_list]
+        recommended_crops = predict_suitability(inputs)
 
-    # Boost ML scores based on mandi demand
-    for rec in recommended_crops:
-        if rec["crop"] in high_demand_crop_names:
-            rec["suitability_score"] = min(1.0, rec["suitability_score"] + 0.25)
-            rec["market_demand"] = "High"
-        else:
-            rec["market_demand"] = "Low"
+        mandi = get_best_mandi(city)
+        high_demand_crops = get_high_demand_crops(mandi)
 
-    recommended_crops.sort(key=lambda x: x["suitability_score"], reverse=True)
+        for crop in recommended_crops:
+            if crop["crop"] in high_demand_crops:
+                crop["market_demand"] = "High"
+                crop["suitability_score"] = min(
+                    1.0, crop["suitability_score"] + 0.25
+                )
+            else:
+                crop["market_demand"] = "Low"
 
-    clean_high_demand = [
-        {"crop": item["crop"], "market_demand": "High"}
-        for item in high_demand_list
-    ]
+        recommended_crops.sort(
+            key=lambda x: x["suitability_score"], reverse=True
+        )
 
-    response = {
-        "city": city,
-        "matched_mandi": mandi or "No close match found",
-        "recommended_crops": recommended_crops,
-        "high_demand_crops_in_city": clean_high_demand
-    }
+        response = {
+            "city": city,
+            "matched_mandi": mandi if mandi else "No close match found",
+            "high_demand_crops_in_city": [
+                {"crop": c, "market_demand": "High"} for c in high_demand_crops
+            ],
+            "recommended_crops": recommended_crops
+        }
 
-    return jsonify(response)
+        return jsonify(response), 200
 
-
-@app.route("/")
-def home():
-    return (
-        "<h1>Crop Recommendation API is Running!</h1>"
-        "<p>Send POST request to <b>/recommend</b> with JSON body.</p>"
-    )
+    except Exception as e:
+        return jsonify({
+            "error": "Internal Server Error",
+            "details": str(e)
+        }), 500
 
 
+# -------------------- MAIN --------------------
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    app.run(debug=True)
