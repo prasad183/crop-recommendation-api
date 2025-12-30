@@ -19,8 +19,10 @@ MONGO_URI = os.getenv("MONGO_URI")
 if not MONGO_URI:
     raise Exception("❌ MONGO_URI environment variable not set")
 
-client = MongoClient(MONGO_URI)
-db = client["cropdb"]
+client = MongoClient(
+    MONGO_URI,
+    serverSelectionTimeoutMS=5000
+)
 
 # ================== HELPER FUNCTIONS ==================
 
